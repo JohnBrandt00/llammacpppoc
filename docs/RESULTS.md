@@ -198,6 +198,46 @@ this model. The project reduces to **one stage**: a per-layer LRU expert cache i
 VRAM, with the GPU computing resident (cached) experts and the CPU handling
 misses. Target realized hit rate ~83-88% at a 33% VRAM budget.
 
+## Keystone experiment — forcing decode experts onto the GPU (no cache)
+
+llama.cpp keeps batch-1 (decode) expert GEMMs on the CPU because the CUDA
+backend only offloads a host-weight op when `batch_size >=
+op_offload_min_batch_size` (default 32, env `GGML_OP_OFFLOAD_MIN_BATCH`;
+`ggml_backend_cuda_device_offload_op` in ggml-cuda.cu). Setting it to 1 forces
+decode MoE onto the GPU — with the existing per-token expert copy and **no
+persistent cache**:
+
+| Decode (`-ncmoe 48`, `-p 0 -n 128`) | tg t/s |
+|---|---:|
+| CPU experts (default `min_batch=32`) | 9.88 |
+| GPU experts forced (`min_batch=1`, per-token copy, no cache) | 4.61 |
+
+Forcing experts to the GPU naively is **2.1x slower** than the CPU baseline,
+confirming the core thesis: a cold per-token copy loses to CPU compute. The win
+exists only if experts are **resident** so the copy is skipped on cache hits.
+
+## Build plan (the one remaining stage)
+
+Everything above reduces the project to a single, well-specified build:
+
+1. **Force decode MoE onto the GPU** — `GGML_OP_OFFLOAD_MIN_BATCH=1` (no code).
+2. **Persistent VRAM expert cache** with plain **LRU** eviction. Today the
+   scheduler's "copy only used experts" path (ggml-backend.cpp) copies *all*
+   routed experts into a transient per-graph buffer every forward pass. Replace
+   that with a persistent VRAM slot pool keyed by (layer, expert): on a hit,
+   reuse the resident slot (no copy); on a miss, copy into an LRU-evicted slot
+   and keep it resident across tokens. The `mul_mat_id` GEMM must read each
+   expert from its slot (gather by cached pointer/offset).
+3. **Leave misses' copies synchronous for v1** — at the measured ~83-88% LRU hit
+   rate, per-token copy volume drops from 8 experts/layer to ~1-1.4, which alone
+   should lift the GPU path back above the 9.9 t/s CPU baseline toward the
+   resident-expert ceiling (16-19 t/s seen in the `-ncmoe` sweep). A later
+   refinement can route misses to CPU compute instead of copying.
+
+Expected v1 outcome at 33% VRAM budget: ~83-88% of expert GEMMs served resident
+on GPU, decode in the high-teens t/s vs 9.9 baseline. Stages 2-4 predictors are
+deferred/dropped (reactive LRU is already ~92-94% of Belady).
+
 ## Caveats / methodology notes
 
 - `GGML_MOE_PREFETCH_METRICS=1` enables the counters; they are written directly
