@@ -60,9 +60,11 @@ static bool cuda_expert_cache_stats_enabled() {
 }
 
 static bool cuda_expert_cache_batch_enabled() {
+    // default on (when the batched API is available); set the env to 0 to force
+    // the per-expert path
     static const int enabled = []() {
         const char * env = getenv("GGML_MOE_EXPERT_CACHE_BATCH");
-        return env && atoi(env) != 0 ? 1 : 0;
+        return env ? (atoi(env) != 0 ? 1 : 0) : 1;
     }();
     return enabled != 0;
 }
