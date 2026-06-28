@@ -24,12 +24,33 @@ GB = 1024 ** 3
 MB = 1024 ** 2
 
 
+def read_text(path: Path) -> str:
+    """Read a log file, tolerating UTF-8/UTF-16 with or without BOM.
+
+    PowerShell's Tee-Object on Windows PowerShell 5.1 writes UTF-16LE, while the
+    bash bench script writes UTF-8. Sniff the BOM, then fall back to detecting
+    BOM-less UTF-16 by the tell-tale interleaved null bytes.
+    """
+    raw = path.read_bytes()
+    if raw.startswith(b"\xff\xfe"):
+        return raw.decode("utf-16-le", errors="replace")
+    if raw.startswith(b"\xfe\xff"):
+        return raw.decode("utf-16-be", errors="replace")
+    if raw.startswith(b"\xef\xbb\xbf"):
+        return raw.decode("utf-8-sig", errors="replace")
+    # BOM-less UTF-16 shows up as many NUL bytes among ASCII text.
+    head = raw[:4096]
+    if head and head.count(0) > len(head) // 4:
+        order = "utf-16-le" if raw[1:2] == b"\x00" else "utf-16-be"
+        return raw.decode(order, errors="replace")
+    return raw.decode("utf-8", errors="replace")
+
+
 def iter_metrics(path: Path):
-    with path.open("r", encoding="utf-8", errors="replace") as f:
-        for line in f:
-            match = METRIC_RE.search(line)
-            if match:
-                yield json.loads(match.group(1))
+    for line in read_text(path).splitlines():
+        match = METRIC_RE.search(line)
+        if match:
+            yield json.loads(match.group(1))
 
 
 def safe_div(num, den):
