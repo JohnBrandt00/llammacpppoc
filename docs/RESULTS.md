@@ -171,6 +171,33 @@ mechanism than per-token reactive prefetch.
 Caveat: two domains (code, prose); both confirm. A topic-switching worst-case
 trace is still worth capturing but is unlikely to change the verdict.
 
+## Cache policy selection (offline simulation)
+
+Before writing the CUDA cache, the routing traces were replayed through a
+per-layer expert cache (M = 42 of 128 slots, 33% budget) under several eviction
+policies to find the realized *online* hit rate and how close each gets to the
+Belady optimal (`simulate_cache.py`):
+
+| Policy | code | prose | of optimal |
+|---|---:|---:|---:|
+| static frequency (warmup top-M) | 73.4% | 87.3% | 81-93% |
+| **LRU** | **83.1%** | **87.8%** | **92-94%** |
+| LRU-2 (K=2) | 81.9% | 87.7% | 90-94% |
+| LFU | 78.3% | 86.5% | 86-93% |
+| Belady (optimal) | 90.6% | 93.5% | — |
+
+**Design decision: plain LRU.** It beats static placement, LFU, and even the
+LRU-K(2) the original plan proposed, and reaches 92-94% of the Belady ceiling.
+The simplest policy is the best, so v1 needs no frequency table, no K-history,
+and no predictor.
+
+**Roadmap simplification.** Reactive LRU already lands within ~8% of the
+theoretical optimum, so the plan's Stages 2-4 (history / Markov / neural-net
+predictors, ~5+ weeks) chase a marginal gap and are very likely unnecessary on
+this model. The project reduces to **one stage**: a per-layer LRU expert cache in
+VRAM, with the GPU computing resident (cached) experts and the CPU handling
+misses. Target realized hit rate ~83-88% at a 33% VRAM budget.
+
 ## Caveats / methodology notes
 
 - `GGML_MOE_PREFETCH_METRICS=1` enables the counters; they are written directly
