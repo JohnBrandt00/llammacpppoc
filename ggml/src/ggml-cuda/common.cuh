@@ -1140,6 +1140,9 @@ const ggml_cuda_device_info & ggml_cuda_info();
 void ggml_cuda_set_device(int device);
 int ggml_cuda_get_device();
 
+// register the persistent MoE expert-weight cache hook (expert-cache.cu)
+void ggml_cuda_register_moe_expert_cache();
+
 struct ggml_cuda_pool {
     virtual ~ggml_cuda_pool() = default;
 

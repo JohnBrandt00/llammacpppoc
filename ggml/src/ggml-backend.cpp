@@ -1632,6 +1632,27 @@ static void ggml_backend_sched_moe_metrics_record_wait(uint64_t wait_us) {
     g_moe_copy_metrics.wait_us.fetch_add(wait_us);
 }
 
+// Optional persistent device-side MoE expert weight cache (registered by a
+// backend such as CUDA). See ggml-backend-impl.h.
+static ggml_moe_expert_cache_cpy_t g_moe_expert_cache_cpy = NULL;
+
+void ggml_backend_set_moe_expert_cache_cpy(ggml_moe_expert_cache_cpy_t fn) {
+    g_moe_expert_cache_cpy = fn;
+}
+
+ggml_moe_expert_cache_cpy_t ggml_backend_get_moe_expert_cache_cpy(void) {
+    return g_moe_expert_cache_cpy;
+}
+
+static bool ggml_backend_sched_moe_expert_cache_enabled() {
+    static const bool enabled = []() {
+        const char * env = getenv("GGML_MOE_EXPERT_CACHE");
+        return env && atoi(env) != 0;
+    }();
+
+    return enabled;
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -1760,29 +1781,60 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             size_copy);
                     };
 
-                    int id = 0;
-                    while (!ggml_bitset_get(used_ids.data(), id)) {
-                        id++;
-                    }
-                    int32_t first_id = id;
-                    int32_t last_id = first_id;
+                    const bool use_expert_cache =
+                        g_moe_expert_cache_cpy && ggml_backend_sched_moe_expert_cache_enabled();
 
-                    for (++id; id < n_expert; ++id) {
-                        if (!ggml_bitset_get(used_ids.data(), id)) {
-                            continue;
+                    if (use_expert_cache) {
+                        // serve each used expert from the persistent device cache;
+                        // a hit avoids the host->device copy, a miss loads it once
+                        // and keeps it resident across tokens
+                        for (int64_t eid = 0; eid < n_expert; ++eid) {
+                            if (!ggml_bitset_get(used_ids.data(), eid)) {
+                                continue;
+                            }
+                            const size_t expert_offset = (size_t) eid * expert_size;
+                            const bool   last          = eid == n_expert - 1;
+                            const size_t padding_end   = last ? 0 : std::min<size_t>(expert_size, 512);
+
+                            if (!g_moe_expert_cache_cpy(split_backend, input_cpy, expert_offset,
+                                    (const uint8_t *)input->data + expert_offset, expert_size, last)) {
+                                // cache declined (e.g. oversized): normal host->device copy
+                                ggml_backend_tensor_set_async(split_backend, input_cpy,
+                                    (const uint8_t *)input->data + expert_offset, expert_offset,
+                                    expert_size + padding_end);
+                            }
+
+                            if (moe_metrics) {
+                                moe_payload_bytes   += expert_size;
+                                moe_scheduled_bytes += expert_size + padding_end;
+                                moe_copy_groups++;
+                            }
                         }
+                    } else {
+                        int id = 0;
+                        while (!ggml_bitset_get(used_ids.data(), id)) {
+                            id++;
+                        }
+                        int32_t first_id = id;
+                        int32_t last_id = first_id;
 
-                        if (id == last_id + 1) {
+                        for (++id; id < n_expert; ++id) {
+                            if (!ggml_bitset_get(used_ids.data(), id)) {
+                                continue;
+                            }
+
+                            if (id == last_id + 1) {
+                                last_id = id;
+                                continue;
+                            }
+
+                            copy_experts(first_id, last_id);
+
+                            first_id = id;
                             last_id = id;
-                            continue;
                         }
-
                         copy_experts(first_id, last_id);
-
-                        first_id = id;
-                        last_id = id;
                     }
-                    copy_experts(first_id, last_id);
 
                     split_had_moe_copy = true;
 

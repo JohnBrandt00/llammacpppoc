@@ -256,12 +256,36 @@ deferred/dropped (reactive LRU is already ~92-94% of Belady).
   while `input_cpy` is still populated at natural offsets so the GEMM is
   unchanged.
 
-- **Remaining (needs model-in-the-loop validation).** A CUDA pool wrapper
-  (`expert-cache.cu`: dedicated pool, `H2D` on miss into an LRU slot, `D2D`
-  slot->`input_cpy`), gated behind an env var, invoked from the MoE copy path in
-  ggml-backend.cpp via a CUDA helper that takes the split backend's stream and
-  the `input_cpy` device pointer. Validate decode t/s with `llama-bench` and
-  output correctness with a short `llama-cli` run.
+- **CUDA cache — built & working.** `expert-cache.cu` owns a dedicated VRAM
+  slot pool, registered via the `ggml_backend_set_moe_expert_cache_cpy` hook
+  (ggml-backend-impl.h) and invoked per expert from the MoE copy path in
+  ggml-backend.cpp. Key = the expert's stable host address; hit -> D2D
+  slot->`input_cpy`, miss -> H2D host->slot then D2D. Enable with
+  `GGML_MOE_EXPERT_CACHE=1` (plus `GGML_OP_OFFLOAD_MIN_BATCH=1` to force decode
+  onto the GPU); size with `GGML_MOE_EXPERT_CACHE_BYTES`.
+
+  **Validation (Qwen3-30B-A3B, `-ncmoe 48`, decode):**
+
+  | Config | tg t/s |
+  |---|---:|
+  | CPU experts (baseline) | 9.9 |
+  | GPU-forced, no cache | ~7-8 |
+  | GPU-forced, cache 2 GiB pool | 9.3 |
+  | GPU-forced, cache 4 GiB pool | **12.2** |
+
+  Correctness: cache-on vs cache-off generate **bit-identical** tokens (the cache
+  is lossless), confirmed with a seeded `llama-cli` run. The cache scales with
+  pool size and at 4 GiB beats the CPU baseline by ~23%.
+
+  **Gotcha:** the pool is dedicated VRAM that competes with the KV cache and
+  compute buffers. It is sized from *free* VRAM (`cudaMemGetInfo`) with a 1.5 GiB
+  headroom; a too-large fixed pool OOM-crashes the model (observed at a blind
+  3 GiB pool with a large context). Default budget is a conservative 2 GiB.
+
+- **Remaining.** Eliminate the per-hit D2D into `input_cpy` by having the GEMM
+  read resident experts directly from their slots (gather), which should close
+  the gap to the `-ncmoe` residency ceiling (16-19 t/s). Pin host memory so
+  misses are truly async.
 
 ## Caveats / methodology notes
 

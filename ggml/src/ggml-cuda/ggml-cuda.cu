@@ -5731,6 +5731,10 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
         /* .context = */ ctx,
     };
 
+    // register the persistent MoE expert-weight cache hook (no-op unless
+    // GGML_MOE_EXPERT_CACHE is enabled)
+    ggml_cuda_register_moe_expert_cache();
+
     return cuda_backend;
 }
 
