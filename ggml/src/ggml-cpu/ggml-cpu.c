@@ -1522,6 +1522,50 @@ static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
     return ptr;
 }
 
+// Optional MoE routing trace. When GGML_MOE_ROUTING_TRACE names a file (or "1"
+// for a default name) the experts selected per layer per token are appended,
+// one line per token: "<layer> <e0> <e1> ... <e_{n_used-1}>". Used offline to
+// measure expert activation skew and temporal locality. Filtered to the gate
+// projection so each layer's routing (shared across gate/up/down) is logged
+// once, and only ever called from the ith==0 thread of a mul_mat_id op.
+static void ggml_moe_routing_trace(const struct ggml_tensor * src0, const struct ggml_tensor * ids) {
+    static FILE *  trace_file  = NULL;
+    static int     trace_state = 0; // 0=uninit, 1=on, 2=off
+    static int64_t trace_lines = 0;
+
+    if (trace_state == 0) {
+        const char * path = getenv("GGML_MOE_ROUTING_TRACE");
+        if (path && path[0] && strcmp(path, "0") != 0) {
+            const char * fname = strcmp(path, "1") == 0 ? "moe_routing_trace.txt" : path;
+            trace_file = fopen(fname, "w");
+        }
+        trace_state = trace_file ? 1 : 2;
+    }
+    if (trace_state != 1) {
+        return;
+    }
+
+    const char * blk = strstr(src0->name, "blk.");
+    if (blk == NULL || strstr(src0->name, "ffn_gate_exps") == NULL) {
+        return;
+    }
+    const int layer = atoi(blk + 4);
+
+    const int n_ids = ids->ne[0];
+    for (int64_t t = 0; t < ids->ne[1]; ++t) {
+        fprintf(trace_file, "%d", layer);
+        for (int id = 0; id < n_ids; ++id) {
+            const int32_t e = *(const int32_t *)((const char *) ids->data + t*ids->nb[1] + id*ids->nb[0]);
+            fprintf(trace_file, " %" PRId32, e);
+        }
+        fprintf(trace_file, "\n");
+    }
+    if ((trace_lines += ids->ne[1]) >= 8192) {
+        fflush(trace_file);
+        trace_lines = 0;
+    }
+}
+
 static void ggml_compute_forward_mul_mat_id(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
@@ -1611,6 +1655,8 @@ static void ggml_compute_forward_mul_mat_id(
     }
 
     if (ith == 0) {
+        ggml_moe_routing_trace(src0, ids);
+
         // initialize matrix_row_counts
         memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
 

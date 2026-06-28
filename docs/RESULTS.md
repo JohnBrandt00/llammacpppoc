@@ -132,6 +132,46 @@ in two sweeps), but the monotonic slope is stable and steep. `-ncmoe 30`
   dynamic cache beats the static layer split at equal VRAM. That is the next
   thing to measure.
 
+## Stage 1 go/no-go — routing skew & locality
+
+To decide whether a *dynamic, expert-granularity* cache can beat the *static,
+layer-granularity* residency that `-ncmoe` already provides, the CPU
+`mul_mat_id` op was instrumented (`GGML_MOE_ROUTING_TRACE=<file>`) to log the
+experts selected per layer per token. Trace captured with `llama-cli`,
+`-ngl 99 -ncmoe 48` (all 48 layers route on CPU), 256 generated tokens.
+
+Code-generation prompt (red-black tree in C), 258 tokens × 48 layers:
+
+| Metric | Value |
+|---|---|
+| Distinct experts used / layer | ~101 of 128 (routing is broad) |
+| Activation Gini (pooled) | 0.184 (only modestly skewed) |
+| lag-1 expert overlap | 41.2% |
+
+Cache hit rate at a 33% VRAM budget (cache top-42 of 128 experts per layer):
+
+| Strategy | Hit rate |
+|---|---:|
+| Static `-ncmoe` (layer granularity) | ~33% |
+| Dynamic, oracle top-42 | **81.3%** |
+| Dynamic, warm top-42 (learned from 1st half, tested on 2nd) | **73.4%** |
+
+Oracle hit-rate curve: 6% budget -> 34%, 12% -> 51%, 25% -> 72%, 33% -> 81%,
+50% -> 93%.
+
+**Verdict: build the dynamic cache.** Even with broad, only-modestly-skewed
+routing, a frequency cache that keeps each layer's *hottest* experts resident
+hits ~73% (warm) vs ~33% (static `-ncmoe`) at equal VRAM — a >2x reduction in
+expert misses. Budget is far better spent on the popular experts of *every*
+layer than on *all* experts of a third of the layers. The 41% lag-1 overlap
+also means a naive reactive (previous-token) predictor tops out near 41%, so a
+frequency/LFU-style resident cache is the better mechanism, not per-token
+reactive prefetch.
+
+Caveat: single domain (code). Prose / topic-switching traces still to be run to
+confirm the hit rate holds across workloads; code is expected to be near the
+high-locality end.
+
 ## Caveats / methodology notes
 
 - `GGML_MOE_PREFETCH_METRICS=1` enables the counters; they are written directly
