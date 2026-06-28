@@ -140,37 +140,36 @@ layer-granularity* residency that `-ncmoe` already provides, the CPU
 experts selected per layer per token. Trace captured with `llama-cli`,
 `-ngl 99 -ncmoe 48` (all 48 layers route on CPU), 256 generated tokens.
 
-Code-generation prompt (red-black tree in C), 258 tokens × 48 layers:
+Two domains, ~256 generated tokens each (× 48 layers):
 
-| Metric | Value |
-|---|---|
-| Distinct experts used / layer | ~101 of 128 (routing is broad) |
-| Activation Gini (pooled) | 0.184 (only modestly skewed) |
-| lag-1 expert overlap | 41.2% |
+| Domain | distinct experts/layer | Gini | lag-1 overlap |
+|---|---:|---:|---:|
+| code (red-black tree in C) | ~101 of 128 | 0.184 | 41.2% |
+| prose (jazz history essay) | ~86 of 128 | 0.209 | 45.2% |
 
 Cache hit rate at a 33% VRAM budget (cache top-42 of 128 experts per layer):
 
-| Strategy | Hit rate |
-|---|---:|
-| Static `-ncmoe` (layer granularity) | ~33% |
-| Dynamic, oracle top-42 | **81.3%** |
-| Dynamic, warm top-42 (learned from 1st half, tested on 2nd) | **73.4%** |
+| Strategy | code | prose |
+|---|---:|---:|
+| Static `-ncmoe` (layer granularity) | ~33% | ~33% |
+| Dynamic, oracle top-42 | 81.3% | 89.1% |
+| Dynamic, warm top-42 (learn 1st half, test 2nd) | **73.4%** | **87.3%** |
 
-Oracle hit-rate curve: 6% budget -> 34%, 12% -> 51%, 25% -> 72%, 33% -> 81%,
-50% -> 93%.
+Oracle hit-rate curve (code / prose): 12% budget -> 51% / 58%, 25% -> 72% / 81%,
+33% -> 81% / 89%, 50% -> 93% / 98%.
 
-**Verdict: build the dynamic cache.** Even with broad, only-modestly-skewed
-routing, a frequency cache that keeps each layer's *hottest* experts resident
-hits ~73% (warm) vs ~33% (static `-ncmoe`) at equal VRAM — a >2x reduction in
-expert misses. Budget is far better spent on the popular experts of *every*
-layer than on *all* experts of a third of the layers. The 41% lag-1 overlap
-also means a naive reactive (previous-token) predictor tops out near 41%, so a
-frequency/LFU-style resident cache is the better mechanism, not per-token
-reactive prefetch.
+**Verdict: build the dynamic cache.** Across both domains, with broad and only
+modestly-skewed routing (Gini ~0.2, ~90-100 of 128 experts used per layer), a
+frequency cache that keeps each layer's *hottest* experts resident hits
+**73-87% (warm)** vs ~33% (static `-ncmoe`) at equal VRAM — a >2x reduction in
+expert misses, and prose is even more cacheable than code. Budget is far better
+spent on the popular experts of *every* layer than on *all* experts of a third
+of the layers. The ~41-45% lag-1 overlap means a naive reactive (previous-token)
+predictor tops out there, so a frequency/LFU-style resident cache is the better
+mechanism than per-token reactive prefetch.
 
-Caveat: single domain (code). Prose / topic-switching traces still to be run to
-confirm the hit rate holds across workloads; code is expected to be near the
-high-locality end.
+Caveat: two domains (code, prose); both confirm. A topic-switching worst-case
+trace is still worth capturing but is unlikely to change the verdict.
 
 ## Caveats / methodology notes
 
