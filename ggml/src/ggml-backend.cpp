@@ -20,6 +20,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <vector>
 
 #ifdef __APPLE__
@@ -1538,6 +1540,93 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+struct ggml_backend_sched_moe_copy_metrics {
+    std::atomic<uint64_t> copy_ops {0};
+    std::atomic<uint64_t> copy_groups {0};
+    std::atomic<uint64_t> expert_slots {0};
+    std::atomic<uint64_t> ids_read {0};
+    std::atomic<uint64_t> payload_bytes {0};
+    std::atomic<uint64_t> scheduled_bytes {0};
+    std::atomic<uint64_t> ids_us {0};
+    std::atomic<uint64_t> schedule_us {0};
+    std::atomic<uint64_t> wait_us {0};
+};
+
+static ggml_backend_sched_moe_copy_metrics g_moe_copy_metrics;
+
+static bool ggml_backend_sched_moe_metrics_enabled() {
+    static const bool enabled = []() {
+        const char * env = getenv("GGML_MOE_PREFETCH_METRICS");
+        return env && atoi(env) != 0;
+    }();
+
+    return enabled;
+}
+
+static int ggml_backend_sched_moe_metrics_interval() {
+    static const int interval = []() {
+        const char * env = getenv("GGML_MOE_PREFETCH_METRICS_INTERVAL");
+        if (!env) {
+            return 128;
+        }
+
+        const int value = atoi(env);
+        return value > 0 ? value : 128;
+    }();
+
+    return interval;
+}
+
+static int64_t ggml_backend_sched_moe_time_us() {
+    const auto now = std::chrono::steady_clock::now().time_since_epoch();
+    return std::chrono::duration_cast<std::chrono::microseconds>(now).count();
+}
+
+static void ggml_backend_sched_moe_metrics_dump(uint64_t copy_ops) {
+    const int interval = ggml_backend_sched_moe_metrics_interval();
+    if (copy_ops == 0 || copy_ops % (uint64_t) interval != 0) {
+        return;
+    }
+
+    GGML_LOG_INFO(
+        "ggml_moe_copy_metrics: {\"copy_ops\":%llu,\"copy_groups\":%llu,\"expert_slots\":%llu,"
+        "\"ids_read\":%llu,\"payload_bytes\":%llu,\"scheduled_bytes\":%llu,"
+        "\"ids_us\":%llu,\"schedule_us\":%llu,\"wait_us\":%llu}\n",
+        (unsigned long long) g_moe_copy_metrics.copy_ops.load(),
+        (unsigned long long) g_moe_copy_metrics.copy_groups.load(),
+        (unsigned long long) g_moe_copy_metrics.expert_slots.load(),
+        (unsigned long long) g_moe_copy_metrics.ids_read.load(),
+        (unsigned long long) g_moe_copy_metrics.payload_bytes.load(),
+        (unsigned long long) g_moe_copy_metrics.scheduled_bytes.load(),
+        (unsigned long long) g_moe_copy_metrics.ids_us.load(),
+        (unsigned long long) g_moe_copy_metrics.schedule_us.load(),
+        (unsigned long long) g_moe_copy_metrics.wait_us.load());
+}
+
+static void ggml_backend_sched_moe_metrics_record_copy(
+        uint64_t payload_bytes,
+        uint64_t scheduled_bytes,
+        uint64_t used_experts,
+        uint64_t ids_read,
+        uint64_t copy_groups,
+        uint64_t ids_us,
+        uint64_t schedule_us) {
+    g_moe_copy_metrics.copy_groups.fetch_add(copy_groups);
+    g_moe_copy_metrics.expert_slots.fetch_add(used_experts);
+    g_moe_copy_metrics.ids_read.fetch_add(ids_read);
+    g_moe_copy_metrics.payload_bytes.fetch_add(payload_bytes);
+    g_moe_copy_metrics.scheduled_bytes.fetch_add(scheduled_bytes);
+    g_moe_copy_metrics.ids_us.fetch_add(ids_us);
+    g_moe_copy_metrics.schedule_us.fetch_add(schedule_us);
+
+    const uint64_t copy_ops = g_moe_copy_metrics.copy_ops.fetch_add(1) + 1;
+    ggml_backend_sched_moe_metrics_dump(copy_ops);
+}
+
+static void ggml_backend_sched_moe_metrics_record_wait(uint64_t wait_us) {
+    g_moe_copy_metrics.wait_us.fetch_add(wait_us);
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -1550,6 +1639,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+        bool split_had_moe_copy = false;
 
         ggml_backend_synchronize(split_backend);
 
@@ -1583,6 +1673,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     (node->src[0] == input_cpy && node->op == GGML_OP_MUL_MAT_ID)
                     //|| (node->src[1] == input_cpy && node->op == GGML_OP_ADD_ID) /* GGML_OP_ADD_ID weights are small and not worth splitting */
                     )) {
+                    const bool moe_metrics = ggml_backend_sched_moe_metrics_enabled();
 
                     const int64_t n_expert   = node->op == GGML_OP_MUL_MAT_ID ? input->ne[2] : input->ne[1];
                     const size_t expert_size = node->op == GGML_OP_MUL_MAT_ID ? input->nb[2] : input->nb[1];
@@ -1603,7 +1694,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         }
                     }
 
+                    int64_t ids_us = 0;
                     if (ids_tensor != prev_ids_tensor) {
+                        const int64_t ids_start_us = moe_metrics ? ggml_backend_sched_moe_time_us() : 0;
+
                         ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
                         ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
                         ggml_backend_synchronize(ids_backend);
@@ -1620,7 +1714,24 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         }
 
                         prev_ids_tensor = ids_tensor;
+                        ids_us = moe_metrics ? ggml_backend_sched_moe_time_us() - ids_start_us : 0;
                     }
+
+                    int64_t used_count = 0;
+                    for (int64_t id = 0; id < n_expert; ++id) {
+                        if (ggml_bitset_get(used_ids.data(), id)) {
+                            used_count++;
+                        }
+                    }
+
+                    if (used_count == 0) {
+                        continue;
+                    }
+
+                    uint64_t moe_payload_bytes = 0;
+                    uint64_t moe_scheduled_bytes = 0;
+                    uint64_t moe_copy_groups = 0;
+                    const int64_t schedule_start_us = moe_metrics ? ggml_backend_sched_moe_time_us() : 0;
 
                     // group consecutive experts and copy them together
                     auto copy_experts = [&](int32_t first_id, int32_t last_id) {
@@ -1628,13 +1739,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
                         const size_t padding = std::min<size_t>(expert_size, 512);
                         const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
+                        const size_t size_copy = expert_size_copy + padding_end;
+
+                        if (moe_metrics) {
+                            moe_payload_bytes += expert_size_copy;
+                            moe_scheduled_bytes += size_copy;
+                            moe_copy_groups++;
+                        }
 
                         ggml_backend_tensor_set_async(split_backend,
                             input_cpy,
                             (const uint8_t *)input->data + expert_offset, expert_offset,
                             // copy a bit extra at the to ensure there are no NaNs in the padding of the last expert
                             // this is necessary for MMQ in the CUDA backend
-                            expert_size_copy + padding_end);
+                            size_copy);
                     };
 
                     int id = 0;
@@ -1660,6 +1778,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         last_id = id;
                     }
                     copy_experts(first_id, last_id);
+
+                    split_had_moe_copy = true;
+
+                    if (moe_metrics) {
+                        const int64_t schedule_us = ggml_backend_sched_moe_time_us() - schedule_start_us;
+                        const uint64_t ids_count = (uint64_t) ids_tensor->ne[0] * (uint64_t) ids_tensor->ne[1];
+                        ggml_backend_sched_moe_metrics_record_copy(
+                            moe_payload_bytes,
+                            moe_scheduled_bytes,
+                            (uint64_t) used_count,
+                            ids_count,
+                            moe_copy_groups,
+                            (uint64_t) ids_us,
+                            (uint64_t) schedule_us);
+                    }
                 } else {
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
@@ -1676,7 +1809,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        const bool moe_metrics = split_had_moe_copy && ggml_backend_sched_moe_metrics_enabled();
+        const int64_t moe_wait_start_us = moe_metrics ? ggml_backend_sched_moe_time_us() : 0;
         ggml_backend_synchronize(split_backend);
+        if (moe_metrics) {
+            ggml_backend_sched_moe_metrics_record_wait((uint64_t) (ggml_backend_sched_moe_time_us() - moe_wait_start_us));
+        }
 
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
