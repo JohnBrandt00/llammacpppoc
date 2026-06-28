@@ -94,6 +94,44 @@ something to serve) or target the prefill copies — which today are issued as
 pinned-memory + dual-stream work in Stage 1 is what makes those copies
 genuinely async and hideable.
 
+## Stage 1 premise check — resident-expert ceiling (zero code)
+
+The plan's Stage 1 assumes streaming experts to VRAM per decode token beats the
+baseline. But PCIe (~28 GB/s) is *slower* than this box's DDR5 (~60-80 GB/s), so
+streaming a **cold** expert per token is slower than the CPU GEMM llama.cpp
+already does. The only win is from experts that are **resident** in VRAM (zero
+transfer). The existing `-ncmoe N` flag measures that ceiling for free: lowering
+N keeps more expert *layers* permanently on the GPU.
+
+Decode (`-p 0 -n 128 -r 2`), `-ngl 99`, single invocation (consistent cache):
+
+| `-ncmoe` | expert layers resident | decode t/s |
+|---:|---:|---:|
+| 48 | 0  | 7.2 |
+| 44 | 4  | 9.0 |
+| 40 | 8  | 12.0 |
+| 36 | 12 | 16.6 |
+| 34 | 14 | 14.7 |
+| 32 | 16 | 15.4 |
+| 30 | 18 | 18.8 |
+
+Moving ~25% of experts into VRAM roughly **doubles** decode throughput. Absolute
+t/s drifts run-to-run with OS file-cache warmth (the 36 row read 16.6 then 13.1
+in two sweeps), but the monotonic slope is stable and steep. `-ncmoe 30`
+(18 layers, ~6.3 GB of experts) fits 8 GB without OOM.
+
+**Conclusions for Stage 1:**
+- Reactive per-token streaming of cold experts is a *non-starter* on this
+  hardware (transfer slower than CPU compute) — drop it.
+- Expert **residency** is the lever, and it is strong. The win the project must
+  chase is keeping the *hottest* experts resident.
+- `-ncmoe` already delivers the *static, layer-granularity* version of this for
+  free. The project's only value-add over the stock flag is **dynamic,
+  expert-granularity** residency (hottest experts across all layers), which is
+  worthwhile only if expert activation is skewed/temporally local enough that a
+  dynamic cache beats the static layer split at equal VRAM. That is the next
+  thing to measure.
+
 ## Caveats / methodology notes
 
 - `GGML_MOE_PREFETCH_METRICS=1` enables the counters; they are written directly
