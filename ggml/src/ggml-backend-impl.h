@@ -275,16 +275,19 @@ extern "C" {
     //
     // A backend (e.g. CUDA) may register a callback that serves MoE expert
     // weights from a persistent device-side cache. The scheduler's "copy only
-    // used experts" path calls it per expert: it copies `size` bytes of expert
-    // weights from host `src` into device tensor `dst` at `dst_offset`, serving
-    // from the cache on a hit (device->device) and loading on a miss
-    // (host->device). `last` marks the final expert of the tensor (no
-    // read-ahead padding). Returns true if handled; false means the caller must
-    // fall back to a normal host->device copy. The hook is NULL unless a backend
-    // registered one and GGML_MOE_EXPERT_CACHE is enabled.
+    // used experts" path calls it once per MoE weight input: for every expert e
+    // whose bit is set in `used_ids`, it copies `expert_size` bytes from the
+    // host weight tensor `src` (expert e at src->data + e*expert_size) into the
+    // device tensor `dst` (input_cpy) at the same offset, serving resident
+    // experts from the cache (device->device) and loading misses (host->device)
+    // while keeping them resident across tokens. Returns true if handled; false
+    // means the caller must fall back to the normal grouped host->device copy.
+    // The hook is NULL unless a backend registered one and GGML_MOE_EXPERT_CACHE
+    // is enabled.
     typedef bool (*ggml_moe_expert_cache_cpy_t)(
-            ggml_backend_t backend, struct ggml_tensor * dst, size_t dst_offset,
-            const void * src, size_t size, bool last);
+            ggml_backend_t backend, struct ggml_tensor * dst,
+            const struct ggml_tensor * src, const uint32_t * used_ids,
+            int64_t n_expert, size_t expert_size);
 
     GGML_API void ggml_backend_set_moe_expert_cache_cpy(ggml_moe_expert_cache_cpy_t fn);
     GGML_API ggml_moe_expert_cache_cpy_t ggml_backend_get_moe_expert_cache_cpy(void);

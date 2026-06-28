@@ -297,10 +297,19 @@ deferred/dropped (reactive LRU is already ~92-94% of Belady).
   headroom; a too-large fixed pool OOM-crashes the model (observed at a blind
   3 GiB pool with a large context). Default budget is a conservative 2 GiB.
 
-- **Remaining.** Eliminate the per-hit D2D into `input_cpy` by having the GEMM
-  read resident experts directly from their slots (gather), which should close
-  the gap to the `-ncmoe` residency ceiling (16-19 t/s). Pin host memory so
-  misses are truly async.
+- **Batched copies (`GGML_MOE_EXPERT_CACHE_BATCH=1`).** The per-token cost was
+  dominated by ~1,152 individual `cudaMemcpyAsync` launches (48 layers x 3 proj x
+  8 experts), not bytes. Replacing them with `cudaMemcpyBatchAsync` (CUDA 12.8+;
+  version-guarded, falls back to per-expert) collapses each MoE input to two
+  batched calls: a *populate* batch (misses host->slot) then a *serve* batch
+  (all experts slot->`input_cpy`, D2D), stream-ordered so serve sees the loaded
+  slots. Controlled A/B (4 GiB pool, same 91.8% hit): **per-expert 11.3 -> batch
+  12.9 t/s (+14%)**, and the batch output is bit-identical to cache-off (still
+  lossless). Opt-in for now; the default stays per-expert (portable to any CUDA).
+
+- **Remaining.** Pin host memory so the miss H2D is truly async; have the GEMM
+  read resident experts directly from their slots to drop the serve D2D entirely
+  (closes the rest of the gap to the `-ncmoe` residency ceiling, 16-19 t/s).
 
 ## Caveats / methodology notes
 

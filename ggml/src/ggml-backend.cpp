@@ -1784,33 +1784,28 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     const bool use_expert_cache =
                         g_moe_expert_cache_cpy && ggml_backend_sched_moe_expert_cache_enabled();
 
+                    bool cache_handled = false;
                     if (use_expert_cache) {
-                        // serve each used expert from the persistent device cache;
-                        // a hit avoids the host->device copy, a miss loads it once
-                        // and keeps it resident across tokens
-                        for (int64_t eid = 0; eid < n_expert; ++eid) {
-                            if (!ggml_bitset_get(used_ids.data(), eid)) {
-                                continue;
-                            }
-                            const size_t expert_offset = (size_t) eid * expert_size;
-                            const bool   last          = eid == n_expert - 1;
-                            const size_t padding_end   = last ? 0 : std::min<size_t>(expert_size, 512);
+                        // serve all used experts for this MoE input from the
+                        // persistent device cache in one call; hits avoid the
+                        // host->device copy and stay resident across tokens
+                        cache_handled = g_moe_expert_cache_cpy(
+                            split_backend, input_cpy, input, used_ids.data(), n_expert, expert_size);
 
-                            if (!g_moe_expert_cache_cpy(split_backend, input_cpy, expert_offset,
-                                    (const uint8_t *)input->data + expert_offset, expert_size, last)) {
-                                // cache declined (e.g. oversized): normal host->device copy
-                                ggml_backend_tensor_set_async(split_backend, input_cpy,
-                                    (const uint8_t *)input->data + expert_offset, expert_offset,
-                                    expert_size + padding_end);
-                            }
-
-                            if (moe_metrics) {
+                        if (cache_handled && moe_metrics) {
+                            for (int64_t eid = 0; eid < n_expert; ++eid) {
+                                if (!ggml_bitset_get(used_ids.data(), eid)) {
+                                    continue;
+                                }
+                                const size_t padding_end = eid < n_expert - 1 ? std::min<size_t>(expert_size, 512) : 0;
                                 moe_payload_bytes   += expert_size;
                                 moe_scheduled_bytes += expert_size + padding_end;
                                 moe_copy_groups++;
                             }
                         }
-                    } else {
+                    }
+
+                    if (!cache_handled) {
                         int id = 0;
                         while (!ggml_bitset_get(used_ids.data(), id)) {
                             id++;
