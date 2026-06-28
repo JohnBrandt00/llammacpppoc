@@ -311,6 +311,39 @@ deferred/dropped (reactive LRU is already ~92-94% of Belady).
   read resident experts directly from their slots to drop the serve D2D entirely
   (closes the rest of the gap to the `-ncmoe` residency ceiling, 16-19 t/s).
 
+## Speculative bets — Stage 0 go/no-go (both negative)
+
+Two ideas from the second plan were evaluated with cheap, model-free checks
+before any build. Both are no-gos for Qwen3-30B-A3B.
+
+**Expert weight synthesis** (`validate_synthesis.py`) — could experts be stored
+as a small latent code + a shared decoder? SVD across the 128 experts of a layer
+(Q4_K dequantized to f32):
+
+| layer | dims for 85% var (want <64) | fidelity>0.92 @K=32 (want >60%) |
+|---|---:|---:|
+| 4 | 107 | 22.7% |
+| 24 | 107 | 23.4% |
+| 40 | 107 | 23.4% |
+
+The expert matrices are nearly full-rank (need 107/128 dims for 85% variance) and
+a 32-float code reconstructs only ~23% of experts acceptably. No shared
+manifold -> **abandon synthesis**. (Measured on dequantized Q4_K, but 107 >> 64
+leaves no doubt.)
+
+**Causal commitment windows** (`simulate_commitment.py`) — lock routing for N
+tokens to raise the hit rate. Simulated on the routing traces:
+
+| N | forced hit (code/prose) | routing fidelity (code/prose) |
+|---|---|---|
+| 2 | 89% / 92% | 40% / 44% |
+| 8 | 95% / 97% | 33% / 37% |
+
+The hit rate is already 83-88% without locking, so the gain is small, while
+fidelity is brutal: even at N=2 only ~40% of forced experts match the natural
+choice (~60% are wrong on locked tokens). Routing is too unstable (lag-1 overlap
+~41%) to lock without wrecking quality -> **not worth building**.
+
 ## Caveats / methodology notes
 
 - `GGML_MOE_PREFETCH_METRICS=1` enables the counters; they are written directly
