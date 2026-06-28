@@ -72,6 +72,9 @@
 !/models/ggml-vocab-*.gguf*
 !/models/templates
 
+# Predictive-prefetch benchmark run artifacts (regenerable)
+/metrics/
+
 # Zig
 
 /zig-out/
