@@ -23,14 +23,27 @@
 #include <mutex>
 
 struct cuda_expert_cache {
-    void *  pool        = nullptr;
-    size_t  expert_size = 0;   // bytes per expert (no padding)
-    size_t  slot_size   = 0;   // expert_size + read-ahead padding
-    int     n_slots     = 0;
-    int     device      = -1;
-    bool    failed      = false;
+    void *   pool        = nullptr;
+    size_t   expert_size = 0;   // bytes per expert (no padding)
+    size_t   slot_size   = 0;   // expert_size + read-ahead padding
+    int      n_slots     = 0;
+    int      device      = -1;
+    bool     failed      = false;
     expert_cache_lru * lru = nullptr;
+
+    // runtime stats (guarded by g_cuda_expert_cache_mutex)
+    uint64_t hits        = 0;
+    uint64_t misses      = 0;
+    uint64_t miss_bytes  = 0;   // host->device bytes actually transferred
 };
+
+static bool cuda_expert_cache_stats_enabled() {
+    static const int enabled = []() {
+        const char * env = getenv("GGML_MOE_EXPERT_CACHE_STATS");
+        return env && atoi(env) != 0 ? 1 : 0;
+    }();
+    return enabled != 0;
+}
 
 static cuda_expert_cache g_cuda_expert_cache;
 static std::mutex        g_cuda_expert_cache_mutex;
@@ -137,6 +150,22 @@ extern "C" bool ggml_cuda_moe_expert_cache_cpy(
     }
     // serve the resident expert into input_cpy at its natural offset
     CUDA_CHECK(cudaMemcpyAsync((char *) dst->data + dst_offset, slot, copy_size, cudaMemcpyDeviceToDevice, stream));
+
+    if (cuda_expert_cache_stats_enabled()) {
+        if (r.hit) {
+            c.hits++;
+        } else {
+            c.misses++;
+            c.miss_bytes += copy_size;
+        }
+        const uint64_t total = c.hits + c.misses;
+        if (total % 200000 == 0) {
+            fprintf(stderr, "ggml_moe_expert_cache_stats: accesses=%llu hit_rate=%.1f%% miss_GiB=%.2f\n",
+                (unsigned long long) total, 100.0 * (double) c.hits / (double) total,
+                (double) c.miss_bytes / (1024.0 * 1024.0 * 1024.0));
+            fflush(stderr);
+        }
+    }
     return true;
 }
 

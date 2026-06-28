@@ -277,6 +277,21 @@ deferred/dropped (reactive LRU is already ~92-94% of Belady).
   is lossless), confirmed with a seeded `llama-cli` run. The cache scales with
   pool size and at 4 GiB beats the CPU baseline by ~23%.
 
+  **Measured runtime hit rate** (`GGML_MOE_EXPERT_CACHE_STATS=1`, `-n 256`):
+
+  | Pool | budget | hit rate | tg t/s |
+  |---|---|---:|---:|
+  | 2 GiB | ~13% | 75.3% | 8.7 |
+  | 4 GiB | ~26% | 91.7% | 13.2 |
+
+  At 4 GiB the realized hit rate (91.7%) exceeds the offline estimate — the
+  global pool reuses hot experts heavily over a long generation. Misses are
+  already ~8% (~85 MB/token), so the remaining gap to the residency ceiling
+  (16-19 t/s) is dominated by the **1,152 individual D2D memcpy launches per
+  token** (48 layers x 3 projections x 8 experts), i.e. launch overhead, not
+  transfer bytes. Removing those (have the GEMM gather weights directly from
+  their slots instead of copying into `input_cpy`) is the next real lever.
+
   **Gotcha:** the pool is dedicated VRAM that competes with the KV cache and
   compute buffers. It is sized from *free* VRAM (`cudaMemGetInfo`) with a 1.5 GiB
   headroom; a too-large fixed pool OOM-crashes the model (observed at a blind
