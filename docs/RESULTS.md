@@ -238,6 +238,31 @@ Expected v1 outcome at 33% VRAM budget: ~83-88% of expert GEMMs served resident
 on GPU, decode in the high-teens t/s vs 9.9 baseline. Stages 2-4 predictors are
 deferred/dropped (reactive LRU is already ~92-94% of Belady).
 
+### Implementation progress
+
+- **Cache core — done & validated.** `ggml/src/ggml-cuda/expert-cache.h` is an
+  O(1) `expert_cache_lru` (hash map + intrusive recency list) mapping packed
+  keys to a fixed slot pool. The standalone `test_expert_cache.cpp` replays the
+  routing traces and reproduces `simulate_cache.py` exactly (83.1% code / 87.8%
+  prose per-layer), so the policy logic is correct independent of any GPU run. A
+  single **global pool** edges out per-layer partitioning (84.1% / 89.2%) and
+  is the chosen layout.
+
+- **Key architectural constraint (found in code).** The scheduler's `input_cpy`
+  copy tensors are persistent per backend, but the graph allocator *reuses their
+  VRAM across layers* (that is exactly why experts are re-copied every pass). So
+  the cache pool must be a **dedicated cudaMalloc the allocator never touches**;
+  the copy path then sources hits VRAM->VRAM from the pool and misses host->VRAM,
+  while `input_cpy` is still populated at natural offsets so the GEMM is
+  unchanged.
+
+- **Remaining (needs model-in-the-loop validation).** A CUDA pool wrapper
+  (`expert-cache.cu`: dedicated pool, `H2D` on miss into an LRU slot, `D2D`
+  slot->`input_cpy`), gated behind an env var, invoked from the MoE copy path in
+  ggml-backend.cpp via a CUDA helper that takes the split backend's stream and
+  the `input_cpy` device pointer. Validate decode t/s with `llama-bench` and
+  output correctness with a short `llama-cli` run.
+
 ## Caveats / methodology notes
 
 - `GGML_MOE_PREFETCH_METRICS=1` enables the counters; they are written directly
