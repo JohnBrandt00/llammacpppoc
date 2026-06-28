@@ -1588,7 +1588,11 @@ static void ggml_backend_sched_moe_metrics_dump(uint64_t copy_ops) {
         return;
     }
 
-    GGML_LOG_INFO(
+    // Write directly to stderr rather than via GGML_LOG_INFO: this is an
+    // opt-in diagnostic (gated by GGML_MOE_PREFETCH_METRICS) and host apps such
+    // as llama-bench install a null log callback that would otherwise swallow
+    // it. fprintf keeps the channel independent of the app's log settings.
+    fprintf(stderr,
         "ggml_moe_copy_metrics: {\"copy_ops\":%llu,\"copy_groups\":%llu,\"expert_slots\":%llu,"
         "\"ids_read\":%llu,\"payload_bytes\":%llu,\"scheduled_bytes\":%llu,"
         "\"ids_us\":%llu,\"schedule_us\":%llu,\"wait_us\":%llu}\n",
@@ -1601,6 +1605,7 @@ static void ggml_backend_sched_moe_metrics_dump(uint64_t copy_ops) {
         (unsigned long long) g_moe_copy_metrics.ids_us.load(),
         (unsigned long long) g_moe_copy_metrics.schedule_us.load(),
         (unsigned long long) g_moe_copy_metrics.wait_us.load());
+    fflush(stderr);
 }
 
 static void ggml_backend_sched_moe_metrics_record_copy(
