@@ -344,6 +344,32 @@ fidelity is brutal: even at N=2 only ~40% of forced experts match the natural
 choice (~60% are wrong on locked tokens). Routing is too unstable (lag-1 overlap
 ~41%) to lock without wrecking quality -> **not worth building**.
 
+## Popularity-tiered precision -- Stage 0 (GO)
+
+Synthesis failed because experts are incompressible in the *weights*. But the
+*traffic* is highly skewed (top 25% of experts handle 73-81% of activations;
+bottom 50% handle 2.5-6.7%), so spend bits by popularity: hot experts at high
+precision, cold experts at low precision. Simulated per-layer split
+(`simulate_mixed_precision.py`, aggregated code+prose traces):
+
+| keep hot (Q4_K) | cold | footprint vs all-Q4 | low-prec exposure |
+|---|---|---:|---:|
+| 50% | Q2_K | 79% | 8.9% |
+| 50% | IQ1  | 68% | 8.9% |
+| 40% | IQ1  | 61% | 15.4% |
+| 25% | IQ1  | 52% | 32.2% |
+
+At keep-50%, only ~9% of token-expert activations touch a low-precision expert
+while the experts shrink 21-32%. Three wins: smaller RAM footprint (bigger models
+fit), more experts fit the VRAM cache (higher hit rate), fewer bytes per cold
+miss. Verdict: viable -- the skew synthesis couldn't find in the weights is real
+in the bits.
+
+Implementation caveat: GGUF stacks all experts of a layer into one tensor with a
+single quant type, so per-expert precision needs reorganizing the stacked expert
+tensors (hot/cold sub-tensors) -- a moderate build, not a flag. Exposure is a
+proxy; confirm real quality with perplexity before shipping.
+
 ## Caveats / methodology notes
 
 - `GGML_MOE_PREFETCH_METRICS=1` enables the counters; they are written directly
