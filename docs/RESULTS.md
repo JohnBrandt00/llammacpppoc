@@ -384,3 +384,49 @@ proxy; confirm real quality with perplexity before shipping.
   on the warmup pass (first touch of the 18.6 GB file from disk), so it is not a
   clean PCIe figure. Treat the per-repetition `t/s` as the reliable performance
   numbers and `payload_bytes` / `expert_slots` as the reliable traffic numbers.
+
+## Tesla P40 (guanshiyin) — cross-platform validation + headline result
+
+Second machine: **NVIDIA Tesla P40** (Pascal sm_61, 24 GB GDDR5, PCIe 3.0) + ~80 GB
+RAM (only ~40 GB usable under load), CUDA 12.4, gcc-12. Built with
+`-DCMAKE_CUDA_ARCHITECTURES=61`. Model: **Qwen3-30B-A3B Q8_0** (32.5 GB, experts in
+RAM via `-ot ".ffn_.*_exps.=CPU" --no-mmap`, non-experts on GPU `-ngl 999`,
+ctx 65536). Expert cache pool sized from free VRAM: 16.00 GiB = 10,277 slots
+(~56% of the 18,432 expert-slots resident). `mode=per-expert` (CUDA 12.4 < 12.8,
+so the `cudaMemcpyBatchAsync` batched path falls back — no +14% here).
+
+Same ~20k-token prompt, decode measured by the server's `eval time` line:
+
+| phase | cache OFF (decode on CPU) | cache ON (GPU + LRU cache) | speedup |
+|---|---|---|---|
+| **decode (eval)** | **2.60 t/s** | **14.39 t/s** | **5.5×** |
+| prefill (prompt eval) | ~88–117 t/s | ~91–114 t/s | ~unchanged |
+
+Decode hit rate (isolating the decode slice between cumulative stat dumps, since
+prefill misses dominate the running total): **~97%** — e.g. accesses 600k→800k
+went 5.0%→28.1% cumulative = 194.8k hits / 200k accesses on the decode tokens.
+Miss traffic over a 200k-access decode window was only ~7 GiB (~42 MiB/token over
+PCIe — negligible).
+
+Why the P40 win (5.5×) dwarfs the 3070 win (+30%):
+1. **Weak host CPU** — 2.6 t/s is the entire CPU decode ceiling on this box, a low
+   bar for the GPU to clear.
+2. **24 GB VRAM** holds 56% of experts → 97% decode hit → nearly every expert GEMM
+   runs on GPU from resident VRAM.
+3. **GPU GEMM ≈ 5.5× the CPU's** for Q8 expert matmuls.
+
+Prefill is **net-neutral**: the per-expert "thrashing" during prefill (working set
+= all experts > pool → ~1% hit, ~900 GiB of wasted H2D over a long run) costs no
+measurable prefill t/s, because prefill is GEMM-bound and the H2D overlaps. So the
+cache is pure upside on this box.
+
+**This is the project's headline result**: the LRU expert cache turns a 30B MoE
+that does not fit in 24 GB VRAM from *unusably slow* (2.6 t/s, CPU-bound) into
+*perfectly usable* (14.4 t/s, GPU-speed) by keeping hot experts resident and
+streaming the ~3% of misses from RAM — exactly the original goal of running models
+too large for VRAM at GPU speed. (Cross-platform: identical code path, no source
+changes; CUDA-version guard handles the batched-copy difference.)
+
+A clear next improvement: **bypass the cache for large (prefill) batches** and
+engage it only for small (decode) batches — eliminates the ~900 GiB of pointless
+prefill H2D with zero downside, since prefill gets no benefit from it.
