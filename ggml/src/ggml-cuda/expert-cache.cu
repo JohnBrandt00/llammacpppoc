@@ -30,6 +30,13 @@
 #define GGML_CUDA_HAS_MEMCPY_BATCH 0
 #endif
 
+// one expert's slot->input_cpy copy, consumed by the single-kernel gather path
+struct moe_gather_desc {
+    void *       dst;
+    const void * src;
+    size_t       size;
+};
+
 struct cuda_expert_cache {
     void *   pool        = nullptr;
     size_t   expert_size = 0;   // bytes per expert (no padding)
@@ -49,6 +56,11 @@ struct cuda_expert_cache {
     std::vector<void *>       serve_dst, pop_dst;
     std::vector<const void *> serve_src, pop_src;
     std::vector<size_t>       serve_size, pop_size;
+
+    // scratch for the single-kernel gather path (Stage A)
+    std::vector<moe_gather_desc> gdesc;       // host staging, one entry per used expert
+    moe_gather_desc *            d_desc = nullptr; // device copy of gdesc
+    size_t                       d_cap  = 0;       // capacity of d_desc, in entries
 };
 
 static bool cuda_expert_cache_stats_enabled() {
@@ -67,6 +79,61 @@ static bool cuda_expert_cache_batch_enabled() {
         return env ? (atoi(env) != 0 ? 1 : 0) : 1;
     }();
     return enabled != 0;
+}
+
+static bool cuda_expert_cache_gather_enabled() {
+    // Stage A: serve all hits with a single gather kernel instead of one D2D
+    // copy per expert. Opt-in (GGML_MOE_EXPERT_CACHE_GATHER=1); takes precedence
+    // over the batched path. This is the substrate for on-device routing.
+    static const int enabled = []() {
+        const char * env = getenv("GGML_MOE_EXPERT_CACHE_GATHER");
+        return env && atoi(env) != 0 ? 1 : 0;
+    }();
+    return enabled != 0;
+}
+
+// Serve N experts slot->input_cpy in one launch: one block per expert, the block
+// cooperatively copies that expert's bytes (vectorised 16 B/word when aligned).
+static __global__ void moe_gather_kernel(const moe_gather_desc * __restrict__ descs) {
+    const moe_gather_desc d = descs[blockIdx.x];
+    char *       __restrict__ dp = (char *)       d.dst;
+    const char * __restrict__ sp = (const char *) d.src;
+    const size_t sz = d.size;
+
+    if ((((uintptr_t) dp | (uintptr_t) sp | sz) & 15u) == 0) {
+        const size_t n4 = sz >> 4;
+        for (size_t i = threadIdx.x; i < n4; i += blockDim.x) {
+            reinterpret_cast<uint4 *>(dp)[i] = reinterpret_cast<const uint4 *>(sp)[i];
+        }
+    } else {
+        for (size_t i = threadIdx.x; i < sz; i += blockDim.x) {
+            dp[i] = sp[i];
+        }
+    }
+}
+
+// Upload the staged descriptors and launch the gather (grows device scratch as
+// needed). Stream-ordered after any miss host->device loads, so the kernel sees
+// freshly populated slots.
+static void cuda_expert_cache_gather_launch(cuda_expert_cache & c, cudaStream_t stream) {
+    const size_t n = c.gdesc.size();
+    if (c.d_cap < n) {
+        if (c.d_desc) {
+            (void) cudaFree(c.d_desc);
+            c.d_desc = nullptr;
+        }
+        const size_t cap = n + n / 2 + 64;
+        if (cudaMalloc(&c.d_desc, cap * sizeof(moe_gather_desc)) != cudaSuccess) {
+            (void) cudaGetLastError();
+            c.d_cap = 0;
+            return;
+        }
+        c.d_cap = cap;
+    }
+    CUDA_CHECK(cudaMemcpyAsync(c.d_desc, c.gdesc.data(), n * sizeof(moe_gather_desc),
+        cudaMemcpyHostToDevice, stream));
+    moe_gather_kernel<<<(unsigned) n, 256, 0, stream>>>(c.d_desc);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 static cuda_expert_cache g_cuda_expert_cache;
@@ -161,7 +228,8 @@ extern "C" bool ggml_cuda_moe_expert_cache_cpy(
         return false;
     }
 
-    const bool   batch    = cuda_expert_cache_batch_enabled() && GGML_CUDA_HAS_MEMCPY_BATCH;
+    const bool   gather   = cuda_expert_cache_gather_enabled();
+    const bool   batch    = !gather && cuda_expert_cache_batch_enabled() && GGML_CUDA_HAS_MEMCPY_BATCH;
     const bool   stats    = cuda_expert_cache_stats_enabled();
     const size_t pad      = expert_size < 512 ? expert_size : 512;
     char * const       dst_base = (char *) dst->data;
@@ -170,6 +238,9 @@ extern "C" bool ggml_cuda_moe_expert_cache_cpy(
     if (batch) {
         c.serve_dst.clear(); c.serve_src.clear(); c.serve_size.clear();
         c.pop_dst.clear();   c.pop_src.clear();   c.pop_size.clear();
+    }
+    if (gather) {
+        c.gdesc.clear();
     }
 
     for (int64_t e = 0; e < n_expert; ++e) {
@@ -185,7 +256,14 @@ extern "C" bool ggml_cuda_moe_expert_cache_cpy(
         const expert_cache_lru::access_result r = c.lru->access((uint64_t) (uintptr_t) host_src);
         char * const slot = (char *) c.pool + (size_t) r.slot * c.slot_size;
 
-        if (batch) {
+        if (gather) {
+            // load misses into their slot now (rare), then serve every used
+            // expert from its slot in a single gather kernel after the loop
+            if (!r.hit) {
+                CUDA_CHECK(cudaMemcpyAsync(slot, host_src, copy_size, cudaMemcpyHostToDevice, stream));
+            }
+            c.gdesc.push_back({ cpy_dst, slot, copy_size });
+        } else if (batch) {
             // serve every expert from its slot (D2D); misses are loaded into
             // their slot first by the populate batch, which runs before serve
             c.serve_dst.push_back(cpy_dst);
@@ -206,6 +284,10 @@ extern "C" bool ggml_cuda_moe_expert_cache_cpy(
         if (stats) {
             if (r.hit) { c.hits++; } else { c.misses++; c.miss_bytes += copy_size; }
         }
+    }
+
+    if (gather && !c.gdesc.empty()) {
+        cuda_expert_cache_gather_launch(c, stream);
     }
 
 #if GGML_CUDA_HAS_MEMCPY_BATCH
@@ -230,7 +312,8 @@ extern "C" bool ggml_cuda_moe_expert_cache_cpy(
             c.stats_dumped = total;
             fprintf(stderr, "ggml_moe_expert_cache_stats: accesses=%llu hit_rate=%.1f%% miss_GiB=%.2f mode=%s\n",
                 (unsigned long long) total, 100.0 * (double) c.hits / (double) total,
-                (double) c.miss_bytes / (1024.0 * 1024.0 * 1024.0), batch ? "batch" : "per-expert");
+                (double) c.miss_bytes / (1024.0 * 1024.0 * 1024.0),
+                gather ? "gather" : (batch ? "batch" : "per-expert"));
             fflush(stderr);
         }
     }
