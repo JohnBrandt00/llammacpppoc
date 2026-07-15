@@ -430,3 +430,69 @@ changes; CUDA-version guard handles the batched-copy difference.)
 A clear next improvement: **bypass the cache for large (prefill) batches** and
 engage it only for small (decode) batches — eliminates the ~900 GiB of pointless
 prefill H2D with zero downside, since prefill gets no benefit from it.
+
+## Optimization pass 2 (2026-06-29/30): what the metrics killed
+
+After Stage A (gather), measured where offloaded-MoE decode time actually goes
+(Qwen3-30B-A3B Q4_K_M, RTX 3070, 2 GiB pool, `GGML_MOE_PREFETCH_METRICS`). Three
+findings, two of them negative -- all data-driven:
+
+**Finding 1 -- the per-layer host sync is negligible (Stage B is dead).**
+`ids_us` (the device->host routing readback + synchronize the scheduler does per
+MoE layer) totalled **~64 ms over a 27 s run = 0.25%**. So moving routing
+on-device to "kill the sync" (Stage B) and CUDA-graph-capturing the result
+(Stage C) would buy ~nothing. Also learned: CUDA graphs are **already enabled**
+for quantized batch-1 MoE decode (upstream `[TAG_MUL_MAT_ID_CUDA_GRAPHS]`, PR
+18958) -- the premise that MoE can't be captured was outdated. Graph/heterogeneous
+rewrite abandoned on evidence.
+
+**Finding 2 -- `--no-mmap` is the real lever (config, not code).** The dominant
+cost looked like expert copies (`schedule_us` = 25.1 s, decode 6.64 t/s) but that
+was **mmap cold-page DISK faults**, not PCIe bandwidth. With `--no-mmap` (model
+fully in RAM): `schedule_us` 25.1 s -> 5.4 s, decode **6.64 -> 15.43 t/s (2.3x)**.
+
+**Finding 3 -- pinned host memory is a NO-GO.** Hypothesis: page-lock the expert
+source so miss H2D is async + 2x faster. Built it (`GGML_MOE_EXPERT_CACHE_PIN`,
+`cudaHostRegister` the source buffer). Result with the model already RAM-resident:
+PIN=1 was **slower** (14.66 vs 15.43 t/s), `schedule_us` rose 5.4 -> 6.7 s. The
+registration overhead is real and the benefit nil -- once experts are in RAM the
+copies aren't PCIe-bound; decode is bound by GEMM + the D2D slot->input_cpy serve.
+Lossless (bit-identical) but useless -> reverted.
+
+**Net:** the LRU cache is near its practical ceiling for the RAM-resident case.
+Remaining real levers: **speculative decoding** (amortize the per-token copy over
+a batch-K verify), **residency** (bigger pool / lower-precision experts), and
+**gather-from-slots** (delete the D2D serve -- the one deep code lever the data
+doesn't rule out). The sync/graph/pinning ideas are closed.
+
+## Expert heat persistence + startup pre-warm (colibri-inspired, 2026-07-14)
+
+Adopted the "learned usage" idea from JustVugg/colibri (which streams a 744B MoE
+from disk using persisted expert-heat stats to pin hot experts): our cache now
+tracks per-(tensor, expert) access counts, persists them across runs, and
+pre-warms the VRAM pool with the known-hot experts at startup. Enable with
+`GGML_MOE_EXPERT_CACHE_HEAT=<file>` (off by default). First run tracks + saves;
+later runs load, pre-warm (pool divided evenly across tensors in the file), and
+keep accumulating.
+
+RTX 3070, Qwen3-30B-A3B Q4_K_M, 3 GiB pool (3,638 slots), 128-token greedy:
+
+| metric | no heat | pre-warmed | delta |
+|---|---|---|---|
+| decode | 14.39 t/s | 15.68 t/s | +9% |
+| prompt eval | 5.82 t/s | 9.54 t/s | **+64%** |
+| hit rate (run) | -- | 69.6% | prewarmed=3600 |
+| output | -- | -- | bit-identical |
+
+Pre-warm filled ~99% of the pool before the first token, so cold-start misses
+(concentrated in prefill) mostly vanish. Two operational notes: (1) the default
+2 GiB pool THRASHES on this model (13% of experts < per-layer working set ->
+hit_rate 0.0%); 3 GiB is past the cliff. Pool size is make-or-break and worth a
+stats check per model/GPU. (2) a 4 GiB pool on the 8 GB display GPU
+oversubscribes WDDM and "locks up" (VRAM paging) -- headroom matters on the
+card driving the desktop. (3) Q4_K_M's down_exps use a different quant/expert
+size than gate/up, so they fall back to the stock copy path (120/144 tensors
+cached); a per-size pool is a possible follow-up.
+
+Value: biggest on the P40 server (every restart starts warm) and a prerequisite
+for the disk tier -- the heat file IS the policy for which experts deserve RAM.

@@ -21,6 +21,11 @@
 #include <cstdlib>
 #include <cstdio>
 #include <mutex>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#include <vector>
 
 // cudaMemcpyBatchAsync was added in CUDA 12.8; without it the batched path is
 // unavailable and the cache falls back to per-expert copies.
@@ -61,6 +66,17 @@ struct cuda_expert_cache {
     std::vector<moe_gather_desc> gdesc;       // host staging, one entry per used expert
     moe_gather_desc *            d_desc = nullptr; // device copy of gdesc
     size_t                       d_cap  = 0;       // capacity of d_desc, in entries
+
+    // expert heat: per (tensor name, expert id) access counts, persisted across
+    // runs (GGML_MOE_EXPERT_CACHE_HEAT=<file>) and used to pre-warm the pool
+    // with the known-hot experts at startup (idea borrowed from colibri's
+    // learned .coli_usage pinning). Traffic is highly skewed, so a small warm
+    // set removes most cold-start misses.
+    std::unordered_map<std::string, std::vector<uint64_t>> heat_counts;
+    std::unordered_map<std::string, std::vector<std::pair<uint32_t, uint64_t>>> heat_hot; // loaded, sorted desc by count
+    std::unordered_set<std::string> heat_prewarmed; // tensors already pre-warmed this run
+    uint64_t heat_prewarm_count = 0;                // experts pre-loaded this run
+    bool     heat_loaded        = false;
 };
 
 static bool cuda_expert_cache_stats_enabled() {
@@ -138,6 +154,114 @@ static void cuda_expert_cache_gather_launch(cuda_expert_cache & c, cudaStream_t 
 
 static cuda_expert_cache g_cuda_expert_cache;
 static std::mutex        g_cuda_expert_cache_mutex;
+
+static const char * cuda_expert_cache_heat_path() {
+    static const char * path = getenv("GGML_MOE_EXPERT_CACHE_HEAT");
+    return path; // not set = feature off
+}
+
+// Persist the accumulated heat on process exit so the next run can pre-warm.
+// Counts are cumulative across runs (loaded counts are merged on load).
+static void cuda_expert_cache_heat_save() {
+    const char * path = cuda_expert_cache_heat_path();
+    if (path == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_cuda_expert_cache_mutex);
+    cuda_expert_cache & c = g_cuda_expert_cache;
+    FILE * f = fopen(path, "w");
+    if (f == nullptr) {
+        fprintf(stderr, "ggml_moe_expert_cache: cannot write heat file '%s'\n", path);
+        return;
+    }
+    uint64_t entries = 0;
+    for (const auto & kv : c.heat_counts) {
+        for (uint32_t e = 0; e < kv.second.size(); ++e) {
+            if (kv.second[e] != 0) {
+                fprintf(f, "%s %u %llu\n", kv.first.c_str(), e, (unsigned long long) kv.second[e]);
+                entries++;
+            }
+        }
+    }
+    fclose(f);
+    const uint64_t total = c.hits + c.misses;
+    fprintf(stderr, "ggml_moe_expert_cache: heat saved to '%s' (%llu entries); "
+        "run: accesses=%llu hit_rate=%.1f%% prewarmed=%llu\n",
+        path, (unsigned long long) entries, (unsigned long long) total,
+        total ? 100.0 * (double) c.hits / (double) total : 0.0,
+        (unsigned long long) c.heat_prewarm_count);
+    fflush(stderr);
+}
+
+// Load the heat file once and build the per-tensor hot lists for pre-warming.
+static void cuda_expert_cache_heat_load(cuda_expert_cache & c) {
+    c.heat_loaded = true;
+    const char * path = cuda_expert_cache_heat_path();
+    if (path == nullptr) {
+        return;
+    }
+    atexit(cuda_expert_cache_heat_save);
+    FILE * f = fopen(path, "r");
+    if (f == nullptr) {
+        fprintf(stderr, "ggml_moe_expert_cache: heat file '%s' not found; tracking, will create on exit\n", path);
+        return;
+    }
+    char name[256];
+    unsigned e;
+    unsigned long long n;
+    while (fscanf(f, "%255s %u %llu", name, &e, &n) == 3) {
+        auto & v = c.heat_counts[name];
+        if (v.size() <= e) {
+            v.resize(e + 1, 0);
+        }
+        v[e] += n;
+    }
+    fclose(f);
+    for (const auto & kv : c.heat_counts) {
+        auto & hot = c.heat_hot[kv.first];
+        for (uint32_t i = 0; i < kv.second.size(); ++i) {
+            if (kv.second[i] != 0) {
+                hot.push_back({i, kv.second[i]});
+            }
+        }
+        std::sort(hot.begin(), hot.end(),
+            [](const std::pair<uint32_t, uint64_t> & a, const std::pair<uint32_t, uint64_t> & b) {
+                return a.second > b.second;
+            });
+    }
+    fprintf(stderr, "ggml_moe_expert_cache: heat loaded from '%s' (%zu tensors) -> pre-warm enabled\n",
+        path, c.heat_hot.size());
+    fflush(stderr);
+}
+
+// Pre-load this tensor's hottest experts into their slots (one-time, first
+// access). The pool is divided evenly between the tensors in the heat file so
+// pre-warming can't evict another tensor's warm set.
+static void cuda_expert_cache_prewarm(cuda_expert_cache & c, const char * name,
+        const char * src_base, size_t expert_size, int64_t n_expert, cudaStream_t stream) {
+    const auto it = c.heat_hot.find(name);
+    if (it == c.heat_hot.end() || it->second.empty()) {
+        return;
+    }
+    const size_t budget = std::max<size_t>(1, (size_t) c.n_slots / c.heat_hot.size());
+    const size_t pad    = expert_size < 512 ? expert_size : 512;
+    const size_t n      = std::min(budget, it->second.size());
+    for (size_t i = 0; i < n; ++i) {
+        const uint32_t e = it->second[i].first;
+        if ((int64_t) e >= n_expert) {
+            continue; // heat file from a different model
+        }
+        const char * host_src = src_base + (size_t) e * expert_size;
+        const expert_cache_lru::access_result r = c.lru->access((uint64_t) (uintptr_t) host_src);
+        if (r.hit) {
+            continue; // already resident
+        }
+        char * const slot = (char *) c.pool + (size_t) r.slot * c.slot_size;
+        const size_t copy_size = expert_size + ((int64_t) e < n_expert - 1 ? pad : 0);
+        CUDA_CHECK(cudaMemcpyAsync(slot, host_src, copy_size, cudaMemcpyHostToDevice, stream));
+        c.heat_prewarm_count++;
+    }
+}
 
 static size_t cuda_expert_cache_budget_bytes() {
     const char * env = getenv("GGML_MOE_EXPERT_CACHE_BYTES");
@@ -235,6 +359,23 @@ extern "C" bool ggml_cuda_moe_expert_cache_cpy(
     char * const       dst_base = (char *) dst->data;
     const char * const src_base = (const char *) src->data;
 
+    // expert heat: load the persisted counts once, pre-warm this tensor's hot
+    // set on first access, and track this run's traffic for the next save
+    std::vector<uint64_t> * heat_vec = nullptr;
+    if (cuda_expert_cache_heat_path() != nullptr) {
+        if (!c.heat_loaded) {
+            cuda_expert_cache_heat_load(c);
+        }
+        if (c.heat_prewarmed.insert(src->name).second) {
+            cuda_expert_cache_prewarm(c, src->name, src_base, expert_size, n_expert, stream);
+        }
+        auto & v = c.heat_counts[src->name];
+        if ((int64_t) v.size() < n_expert) {
+            v.resize(n_expert, 0);
+        }
+        heat_vec = &v;
+    }
+
     if (batch) {
         c.serve_dst.clear(); c.serve_src.clear(); c.serve_size.clear();
         c.pop_dst.clear();   c.pop_src.clear();   c.pop_size.clear();
@@ -284,6 +425,9 @@ extern "C" bool ggml_cuda_moe_expert_cache_cpy(
         if (stats) {
             if (r.hit) { c.hits++; } else { c.misses++; c.miss_bytes += copy_size; }
         }
+        if (heat_vec != nullptr) {
+            (*heat_vec)[e]++;
+        }
     }
 
     if (gather && !c.gdesc.empty()) {
@@ -310,10 +454,11 @@ extern "C" bool ggml_cuda_moe_expert_cache_cpy(
         const uint64_t total = c.hits + c.misses;
         if (total - c.stats_dumped >= 200000) {
             c.stats_dumped = total;
-            fprintf(stderr, "ggml_moe_expert_cache_stats: accesses=%llu hit_rate=%.1f%% miss_GiB=%.2f mode=%s\n",
+            fprintf(stderr, "ggml_moe_expert_cache_stats: accesses=%llu hit_rate=%.1f%% miss_GiB=%.2f mode=%s prewarm=%llu\n",
                 (unsigned long long) total, 100.0 * (double) c.hits / (double) total,
                 (double) c.miss_bytes / (1024.0 * 1024.0 * 1024.0),
-                gather ? "gather" : (batch ? "batch" : "per-expert"));
+                gather ? "gather" : (batch ? "batch" : "per-expert"),
+                (unsigned long long) c.heat_prewarm_count);
             fflush(stderr);
         }
     }
