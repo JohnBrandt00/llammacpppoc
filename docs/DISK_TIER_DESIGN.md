@@ -93,6 +93,33 @@ GLM before writing any code.
   but primary target is the Linux P40 box; Windows is build-and-losslessness
   only for Phase 1.
 
+## Implementation (built 2026-07-15, in expert-cache.cu)
+
+Phase 1 + 2 are implemented behind `GGML_MOE_EXPERT_DISK=1`:
+
+| env var | meaning | default |
+|---|---|---|
+| `GGML_MOE_EXPERT_DISK` | master switch for the disk tier | off |
+| `GGML_MOE_EXPERT_RAM_BYTES` | mlock budget for the hot tier (needs a heat file) | 0 = no pinning |
+| `GGML_MOE_EXPERT_DISK_CACHE_BYTES` | RAM LRU for streamed cold experts | 2 GiB (floor 256 MiB) |
+| `GGML_MOE_EXPERT_DISK_THREADS` | parallel whole-expert reads | 4 |
+
+Mechanics as designed, with one deviation: **no loader changes were needed** —
+each tensor's file + offset is discovered from its own mapping
+(`/proc/self/maps` on Linux; `VirtualQuery` + `K32GetMappedFileName` on
+Windows, so the dev box can execute the full pread path under mmap). Split
+GGUFs work for free (each tensor resolves to its own file). Cold experts are
+pread whole into a bounded RAM LRU by a small thread pool before the H2D
+copies are issued; evicted buffers are quarantined behind a CUDA event so
+in-flight async copies can never read freed memory. Mismatched-expert-size
+tensors (which bypass the VRAM cache) get Phase-1 treatment: heat counting,
+pinning, and whole-expert `MADV_WILLNEED` before the stock grouped copy.
+Requires mmap: under `--no-mmap` the resolver finds anonymous memory and the
+tier cleanly deactivates per tensor. If `mlock` fails (container
+RLIMIT_MEMLOCK), pinning disables globally with a logged warning and the tier
+degrades to readahead + cold LRU. Stats: `ggml_moe_expert_disk_stats: pin_hit
+/ ram_hit / pread / pread_GiB / read_fail / pinned`.
+
 ## Build order
 
 1. Phase 1a: WILLNEED batched readahead on miss (smallest useful piece; helps
