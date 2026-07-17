@@ -496,3 +496,34 @@ cached); a per-size pool is a possible follow-up.
 
 Value: biggest on the P40 server (every restart starts warm) and a prerequisite
 for the disk tier -- the heat file IS the policy for which experts deserve RAM.
+
+## Disk tier: first real-world test (P40 + GLM-4.5-Air, 2026-07-16)
+
+Setup: guanshiyin (P40 24GB, ~40GB usable host RAM, LXC on Unraid, storage
+measured ~110 MB/s effective), GLM-4.5-Air IQ4_XS (58GB, experts ~47GB), mmap +
+GGML_MOE_EXPERT_DISK=1, pin 24GiB, cold LRU 4GiB, VRAM pool 12GiB (4204 slots),
+22.5k-token coding prompt (real workload).
+
+Results:
+- prefill 22,535 tok: **12.02 t/s (31 min)** -- vs 2.14 t/s for Q4_K_XL (73GB)
+- decode: **0.92 t/s**, follow-up prefill via prompt cache 2.1k suffix in 2.8min
+- pager: **pread_GiB=838.63, read_fail=0** over ~294k parallel whole-expert
+  reads; host stable with pin capped at 24GiB. Machinery correct.
+- pin_hit ~= pread (~50/50): the heat file was warmup-only (uniform), so the
+  pinned 24GiB was effectively a random sample. Cold LRU (4GiB) useless at this
+  working set (ram_hit=994 of ~294k). VRAM hit 0.3-0.7% during prefill
+  (expected; prefill = full expert sweep), 11.9% cumulative after decode.
+
+Verdict: the disk tier is CORRECT but this box's storage (110 MB/s) cannot
+carry a model whose expert set exceeds RAM: one 22.5k prefill = 838GB of I/O.
+Lessons: (1) never size the mlock budget from container-reported free RAM --
+50GiB pin starved the Unraid host (mlock is unreclaimable; 24GiB cap is safe);
+(2) heat must come from decode traffic, warmup/prefill heat is uniform junk;
+(3) GLM down_exps (mismatched expert size) bypass the VRAM pool -> multi-size
+pool is the top code lever if this workload returns; (4) the LXC "80GB free"
+is the host's RAM, not the container's to lock.
+
+Path forward (hardware, not software): NVMe (~27x storage) + cheap DDR3 ECC
+(80->256GB, model fully RAM-resident) turns this same code into Qwen-class
+speeds for GLM-Air Q4 and makes 500GB-class models colibri-viable for decode.
+Until then: Qwen3-30B Q8 (fits in RAM, 14.4 t/s proven) is the coding driver.
