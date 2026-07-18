@@ -867,13 +867,24 @@ extern "C" bool ggml_cuda_moe_expert_cache_cpy(
     if (heat_on && !c.heat_loaded) {
         cuda_expert_cache_heat_load(c);
     }
+    // heat quality: prefill ops light up ~every expert, so counting them
+    // drowns the decode-time skew that makes heat rankings useful (measured on
+    // GLM-Air: pin_hit stuck at ~50% = random). Only decode-scale ops (fewer
+    // than half the experts used) contribute counts.
     std::vector<uint64_t> * heat_vec = nullptr;
     if (heat_on) {
-        auto & v = c.heat_counts[src->name];
-        if ((int64_t) v.size() < n_expert) {
-            v.resize(n_expert, 0);
+        int64_t used_count = 0;
+        for (int64_t w = 0; w < (n_expert + 31) / 32; ++w) {
+            uint32_t x = used_ids[w];
+            while (x) { x &= x - 1; used_count++; }
         }
-        heat_vec = &v;
+        if (used_count * 2 < n_expert) {
+            auto & v = c.heat_counts[src->name];
+            if ((int64_t) v.size() < n_expert) {
+                v.resize(n_expert, 0);
+            }
+            heat_vec = &v;
+        }
     }
     moe_disk_tensor * dt = nullptr;
     if (cuda_expert_disk_enabled()) {
